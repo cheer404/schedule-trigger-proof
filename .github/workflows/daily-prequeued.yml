@@ -1,0 +1,142 @@
+name: Daily prequeued runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Probe validates the runner without contacting the target service
+        required: true
+        default: probe
+        type: choice
+        options:
+          - probe
+          - production
+      target_utc:
+        description: Production target time in ISO-8601 UTC
+        required: false
+        type: string
+      wait_environment:
+        description: Environment that holds this run before execution
+        required: true
+        default: daily-queue
+        type: choice
+        options:
+          - one-minute-chain
+          - bootstrap
+          - daily-queue
+
+permissions: {}
+
+jobs:
+  release-and-arm-next-day:
+    environment: ${{ inputs.wait_environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: write
+    steps:
+      - name: Probe timer release
+        if: ${{ inputs.mode == 'probe' }}
+        run: echo "PRODUCTION_TIMER_PROBE_OK $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+      - name: Wait for target and prequeue tomorrow
+        if: ${{ inputs.mode == 'production' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_UTC: ${{ inputs.target_utc }}
+        run: |
+          set -euo pipefail
+          test -n "$TARGET_UTC"
+
+          target_epoch="$(date -u -d "$TARGET_UTC" +%s)"
+          now_epoch="$(date -u +%s)"
+          if (( now_epoch > target_epoch + 3600 )); then
+            echo "::error::Target time expired by more than one hour."
+            exit 1
+          fi
+          if (( now_epoch < target_epoch )); then
+            sleep "$((target_epoch - now_epoch))"
+          fi
+
+          next_target="$(date -u -d "$TARGET_UTC + 1 day" +'%Y-%m-%dT%H:%M:%SZ')"
+          gh workflow run daily-prequeued.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF_NAME" \
+            -f mode=production \
+            -f target_utc="$next_target" \
+            -f wait_environment=daily-queue
+          echo "NEXT_DAY_PREQUEUED target=$next_target"
+
+  run-private-application:
+    needs: release-and-arm-next-day
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    env:
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Restore private application bundle
+        shell: bash
+        env:
+          APP_BUNDLE_B64: ${{ secrets.APP_BUNDLE_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$APP_BUNDLE_B64"
+          install -d -m 700 "$RUNNER_TEMP/private-app"
+          printf '%s' "$APP_BUNDLE_B64" | base64 --decode > "$RUNNER_TEMP/app.tar.gz"
+          tar -xzf "$RUNNER_TEMP/app.tar.gz" -C "$RUNNER_TEMP/private-app"
+          test -f "$RUNNER_TEMP/private-app/main.py"
+          test -f "$RUNNER_TEMP/private-app/requirements.txt"
+
+      - name: Install dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check
+          -r "$RUNNER_TEMP/private-app/requirements.txt"
+
+      - name: Validate private configuration
+        shell: bash
+        env:
+          AHUT_USERS_JSON: ${{ secrets.AHUT_USERS_JSON }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+
+          users = json.loads(os.environ["AHUT_USERS_JSON"])
+          assert isinstance(users, list) and len(users) == 1
+          assert users[0].get("student_id")
+          assert users[0].get("password")
+          PY
+
+      - name: Probe application bundle
+        if: ${{ inputs.mode == 'probe' }}
+        shell: bash
+        run: |
+          python -m py_compile "$RUNNER_TEMP/private-app/main.py"
+          echo "PRIVATE_BUNDLE_PROBE_OK"
+
+      - name: Run private application without public personal logs
+        if: ${{ inputs.mode == 'production' }}
+        shell: bash
+        env:
+          AHUT_USERS_JSON: ${{ secrets.AHUT_USERS_JSON }}
+        run: |
+          set -euo pipefail
+          private_log="$RUNNER_TEMP/private-app.log"
+          trap 'rm -f -- "$private_log"' EXIT
+          cd "$RUNNER_TEMP/private-app"
+
+          if python main.py >"$private_log" 2>&1; then
+            echo "PRIVATE_APPLICATION_COMPLETED_OK"
+          else
+            echo "::error::Private application failed; personal output is intentionally withheld."
+            exit 1
+          fi
