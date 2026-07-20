@@ -10,7 +10,6 @@ on:
         type: choice
         options:
           - probe
-          - entrypoint-probe
           - production
       target_utc:
         description: Production target time in ISO-8601 UTC
@@ -37,7 +36,7 @@ jobs:
       actions: write
     steps:
       - name: Probe timer release
-        if: ${{ inputs.mode != 'production' }}
+        if: ${{ inputs.mode == 'probe' }}
         run: echo "PRODUCTION_TIMER_PROBE_OK $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
       - name: Wait for target and prequeue tomorrow
@@ -123,42 +122,6 @@ jobs:
         run: |
           python -m py_compile "$RUNNER_TEMP/private-app/main.py"
           echo "PRIVATE_BUNDLE_PROBE_OK"
-
-      - name: Run main.py and verify the non-signing-time result
-        if: ${{ inputs.mode == 'entrypoint-probe' }}
-        shell: bash
-        env:
-          AHUT_USERS_JSON: ${{ secrets.AHUT_USERS_JSON }}
-        run: |
-          set -euo pipefail
-          beijing_time="$(TZ=Asia/Shanghai date +'%H:%M:%S')"
-          if [[ "$beijing_time" > "21:20:00" ]]; then
-            echo "::error::Safety check refused to run this probe during the sign-in window."
-            exit 1
-          fi
-
-          private_log="$RUNNER_TEMP/entrypoint-probe.log"
-          trap 'rm -f -- "$private_log"' EXIT
-          cd "$RUNNER_TEMP/private-app"
-
-          set +e
-          python main.py >"$private_log" 2>&1
-          exit_code=$?
-          set -e
-
-          if (( exit_code == 0 )); then
-            echo "::error::main.py unexpectedly returned success outside the sign-in window."
-            exit 1
-          fi
-          expected_result="$(printf '\346\234\252\345\210\260\347\255\276\345\210\260\346\227\266\351\227\264')"
-          if ! grep -Fq "$expected_result" "$private_log"; then
-            echo "::error::main.py failed, but not with the expected non-signing-time result."
-            exit 1
-          fi
-
-          echo "MAIN_PY_EXECUTED=true"
-          echo "MAIN_PY_EXIT_CODE=$exit_code"
-          printf 'MAIN_PY_RESULT=%s\n' "$expected_result"
 
       - name: Run private application without public personal logs
         if: ${{ inputs.mode == 'production' }}
