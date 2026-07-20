@@ -31,7 +31,7 @@ jobs:
   release-and-arm-next-day:
     environment: ${{ inputs.wait_environment }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       actions: write
     steps:
@@ -71,7 +71,7 @@ jobs:
   run-private-application:
     needs: release-and-arm-next-day
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     permissions: {}
     env:
       TZ: Asia/Shanghai
@@ -136,7 +136,14 @@ jobs:
 
           if python main.py >"$private_log" 2>&1; then
             echo "PRIVATE_APPLICATION_COMPLETED_OK"
+            exit 0
+          fi
+
+          echo "::warning::First attempt failed; retrying in ten minutes."
+          sleep 600
+          if python main.py >"$private_log" 2>&1; then
+            echo "PRIVATE_APPLICATION_RETRY_COMPLETED_OK"
           else
-            echo "::error::Private application failed; personal output is intentionally withheld."
+            echo "::error::Private application failed twice; personal output is intentionally withheld."
             exit 1
           fi
