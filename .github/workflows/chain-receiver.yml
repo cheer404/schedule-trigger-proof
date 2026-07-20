@@ -1,0 +1,14 @@
+name: Chain receiver proof
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  receive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Confirm chained dispatch
+        run: echo "CHAIN_RECEIVER_OK $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
