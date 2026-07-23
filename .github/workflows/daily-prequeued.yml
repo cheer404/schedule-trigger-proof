@@ -104,16 +104,41 @@ jobs:
         shell: bash
         env:
           AHUT_USERS_JSON: ${{ secrets.AHUT_USERS_JSON }}
+          AHUT_SHARED_STUDENT_IDS_JSON: ${{ secrets.AHUT_SHARED_STUDENT_IDS_JSON }}
         run: |
           set -euo pipefail
           python - <<'PY'
           import json
           import os
 
+          def normalize_student_id(value):
+              assert not isinstance(value, bool)
+              if isinstance(value, int):
+                  student_id = value
+              elif isinstance(value, str) and value.strip().isdigit():
+                  student_id = int(value.strip())
+              else:
+                  raise AssertionError
+              assert student_id > 0
+              return student_id
+
           users = json.loads(os.environ["AHUT_USERS_JSON"])
-          assert isinstance(users, list) and len(users) == 1
-          assert users[0].get("student_id")
-          assert users[0].get("password")
+          extra_ids = json.loads(os.environ["AHUT_SHARED_STUDENT_IDS_JSON"])
+
+          assert isinstance(users, list) and users
+          assert isinstance(extra_ids, list) and extra_ids
+          assert all(isinstance(user, dict) for user in users)
+          assert all(
+              isinstance(user.get("password"), str) and user["password"]
+              for user in users
+          )
+
+          student_ids = [
+              normalize_student_id(user.get("student_id")) for user in users
+          ]
+          student_ids.extend(normalize_student_id(value) for value in extra_ids)
+          assert len(student_ids) == 2
+          assert len(set(student_ids)) == 2
           PY
 
       - name: Probe application bundle
@@ -128,6 +153,7 @@ jobs:
         shell: bash
         env:
           AHUT_USERS_JSON: ${{ secrets.AHUT_USERS_JSON }}
+          AHUT_SHARED_STUDENT_IDS_JSON: ${{ secrets.AHUT_SHARED_STUDENT_IDS_JSON }}
         run: |
           set -euo pipefail
           private_log="$RUNNER_TEMP/private-app.log"
