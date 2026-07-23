@@ -10,7 +10,6 @@ on:
         type: choice
         options:
           - probe
-          - entrypoint-probe
           - production
       target_utc:
         description: Production target time in ISO-8601 UTC
@@ -37,7 +36,7 @@ jobs:
       actions: write
     steps:
       - name: Probe timer release
-        if: ${{ inputs.mode != 'production' }}
+        if: ${{ inputs.mode == 'probe' }}
         run: echo "PRODUCTION_TIMER_PROBE_OK $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
       - name: Wait for target and prequeue tomorrow
@@ -148,52 +147,6 @@ jobs:
         run: |
           python -m py_compile "$RUNNER_TEMP/private-app/main.py"
           echo "PRIVATE_BUNDLE_PROBE_OK"
-
-      - name: Run main.py and verify both users are outside sign-in time
-        if: ${{ inputs.mode == 'entrypoint-probe' }}
-        shell: bash
-        env:
-          AHUT_USERS_JSON: ${{ secrets.AHUT_USERS_JSON }}
-          AHUT_SHARED_STUDENT_IDS_JSON: ${{ secrets.AHUT_SHARED_STUDENT_IDS_JSON }}
-        run: |
-          set -euo pipefail
-          beijing_time="$(TZ=Asia/Shanghai date +'%H:%M:%S')"
-          if [[ "$beijing_time" > "21:19:59" ]]; then
-            echo "::error::Safety check refused to run during the sign-in window."
-            exit 1
-          fi
-
-          private_log="$RUNNER_TEMP/entrypoint-probe.log"
-          trap 'rm -f -- "$private_log"' EXIT
-          cd "$RUNNER_TEMP/private-app"
-
-          set +e
-          python main.py >"$private_log" 2>&1
-          exit_code=$?
-          set -e
-
-          if (( exit_code != 1 )); then
-            echo "::error::main.py returned an unexpected exit code."
-            exit 1
-          fi
-
-          PRIVATE_LOG="$private_log" python - <<'PY'
-          import os
-          from pathlib import Path
-
-          output = Path(os.environ["PRIVATE_LOG"]).read_text(
-              encoding="utf-8",
-              errors="replace",
-          )
-          assert "本次为 2 人尝试进行签到，成功人数：0" in output
-          assert output.count("未到签到时间") >= 2
-          assert "获取token" not in output
-          PY
-
-          echo "MAIN_PY_EXECUTED=true"
-          echo "MAIN_PY_CONFIGURED_USERS=2"
-          echo "MAIN_PY_EXIT_CODE=$exit_code"
-          echo "MAIN_PY_RESULT=两名用户均未到签到时间"
 
       - name: Run private application without public personal logs
         if: ${{ inputs.mode == 'production' }}
