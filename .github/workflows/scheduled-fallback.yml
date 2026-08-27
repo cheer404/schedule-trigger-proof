@@ -1,97 +1,51 @@
-name: Daily prequeued runner
-run-name: Daily target ${{ inputs.target_utc || 'probe' }}
+name: AHUT scheduled fallback and chain repair
+run-name: Fallback ${{ github.event.schedule || inputs.mode || 'manual' }}
 
 on:
+  schedule:
+    # GitHub cron 使用 UTC：北京时间 21:37、21:52、22:07。
+    - cron: "37 13 * * *"
+    - cron: "52 13 * * *"
+    - cron: "7 14 * * *"
   workflow_dispatch:
     inputs:
       mode:
-        description: Probe validates the runner without contacting the target service
+        description: Probe validates configuration without contacting the target service
         required: true
         default: probe
         type: choice
         options:
           - probe
           - production
-      target_utc:
-        description: Production target time in ISO-8601 UTC
-        required: false
-        type: string
-      wait_environment:
-        description: Environment that holds this run before execution
-        required: true
-        default: daily-queue
-        type: choice
-        options:
-          - one-minute-chain
-          - bootstrap
-          - daily-queue
 
 permissions: {}
 
 jobs:
-  release-and-arm-next-day:
-    environment: ${{ inputs.wait_environment }}
+  arm-next-day:
+    if: ${{ github.event_name == 'schedule' || inputs.mode == 'production' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
     permissions:
       actions: write
       contents: read
-    outputs:
-      target_ready: ${{ steps.release.outputs.target_ready || steps.probe.outputs.target_ready }}
-      arm_succeeded: ${{ steps.arm.outcome == 'success' || inputs.mode == 'probe' }}
     steps:
       - name: Check out scheduler
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - name: Probe timer release
-        id: probe
-        if: ${{ inputs.mode == 'probe' }}
-        run: |
-          echo "target_ready=true" >> "$GITHUB_OUTPUT"
-          echo "PRODUCTION_TIMER_PROBE_OK $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-
-      - name: Wait for target
-        id: release
-        if: ${{ inputs.mode == 'production' }}
-        shell: bash
-        env:
-          TARGET_UTC: ${{ inputs.target_utc }}
-        run: |
-          set -euo pipefail
-          test -n "$TARGET_UTC"
-
-          target_epoch="$(date -u -d "$TARGET_UTC" +%s)"
-          now_epoch="$(date -u +%s)"
-          if (( now_epoch > target_epoch + 3600 )); then
-            echo "::warning::Target is more than one hour late; running the application now and leaving chain repair to the scheduled fallbacks."
-          fi
-          if (( now_epoch < target_epoch )); then
-            sleep "$((target_epoch - now_epoch))"
-          fi
-
-          echo "target_ready=true" >> "$GITHUB_OUTPUT"
-          echo "TARGET_RELEASED target=$TARGET_UTC actual=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-
-      - name: Prequeue tomorrow
-        id: arm
-        if: ${{ inputs.mode == 'production' }}
-        continue-on-error: true
+      - name: Ensure tomorrow is prequeued
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TARGET_UTC: ${{ inputs.target_utc }}
           WORKFLOW_REF: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          next_target="$(date -u -d "$TARGET_UTC + 1 day" +'%Y-%m-%dT%H:%M:%SZ')"
+          next_target="$(date -u -d 'tomorrow 13:35:00 UTC' +'%Y-%m-%dT%H:%M:%SZ')"
           bash .github/scripts/ensure-prequeued.sh \
             "$next_target" daily-queue "$WORKFLOW_REF" 1425
 
-  run-private-application:
-    needs: release-and-arm-next-day
-    if: ${{ always() && needs.release-and-arm-next-day.outputs.target_ready == 'true' }}
+  run-application:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions: {}
@@ -122,7 +76,7 @@ jobs:
           python -m pip install --disable-pip-version-check
           -r "$RUNNER_TEMP/private-app/requirements.txt"
 
-      - name: Validate private configuration
+      - name: Validate single-user configuration
         shell: bash
         env:
           AHUT_USERS_JSON: ${{ secrets.AHUT_USERS_JSON }}
@@ -133,14 +87,16 @@ jobs:
           import os
 
           def normalize_student_id(value):
-              assert not isinstance(value, bool)
+              if isinstance(value, bool):
+                  raise AssertionError
               if isinstance(value, int):
                   student_id = value
               elif isinstance(value, str) and value.strip().isdigit():
                   student_id = int(value.strip())
               else:
                   raise AssertionError
-              assert student_id > 0
+              if student_id <= 0:
+                  raise AssertionError
               return student_id
 
           users = json.loads(os.environ["AHUT_USERS_JSON"])
@@ -150,7 +106,6 @@ jobs:
               isinstance(user.get("password"), str) and user["password"]
               for user in users
           )
-
           student_ids = [
               normalize_student_id(user.get("student_id")) for user in users
           ]
@@ -158,14 +113,14 @@ jobs:
           PY
 
       - name: Probe application bundle
-        if: ${{ inputs.mode == 'probe' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'probe' }}
         shell: bash
         run: |
           python -m py_compile "$RUNNER_TEMP/private-app/main.py"
-          echo "PRIVATE_BUNDLE_PROBE_OK"
+          echo "FALLBACK_PRIVATE_BUNDLE_PROBE_OK"
 
       - name: Run private application without public personal logs
-        if: ${{ inputs.mode == 'production' }}
+        if: ${{ github.event_name == 'schedule' || inputs.mode == 'production' }}
         shell: bash
         env:
           AHUT_USERS_JSON: ${{ secrets.AHUT_USERS_JSON }}
@@ -176,31 +131,15 @@ jobs:
           cd "$RUNNER_TEMP/private-app"
 
           if python main.py >"$private_log" 2>&1; then
-            echo "PRIVATE_APPLICATION_COMPLETED_OK"
+            echo "FALLBACK_PRIVATE_APPLICATION_COMPLETED_OK"
             exit 0
           fi
 
           echo "::warning::First attempt failed; retrying in ten minutes."
           sleep 600
           if python main.py >"$private_log" 2>&1; then
-            echo "PRIVATE_APPLICATION_RETRY_COMPLETED_OK"
+            echo "FALLBACK_PRIVATE_APPLICATION_RETRY_COMPLETED_OK"
           else
             echo "::error::Private application failed twice; personal output is intentionally withheld."
             exit 1
           fi
-
-  report-arm-failure:
-    needs:
-      - release-and-arm-next-day
-      - run-private-application
-    if: >-
-      ${{ always() &&
-          needs.release-and-arm-next-day.outputs.target_ready == 'true' &&
-          needs.release-and-arm-next-day.outputs.arm_succeeded != 'true' }}
-    runs-on: ubuntu-latest
-    permissions: {}
-    steps:
-      - name: Report next-day queue failure
-        run: |
-          echo "::error::Today's application was allowed to run, but the next-day prequeued task could not be confirmed. Scheduled fallbacks will retry the repair."
-          exit 1
